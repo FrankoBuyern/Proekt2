@@ -1,10 +1,12 @@
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Console game: seller must confirm payments and restock.
- * Puts nice ASCII formatting and ANSI colors.
+ * Обновлённый MainGame:
+ * - исправлена проблема "зависания" из-за одновременного чтения Scanner в двух потоках;
+ * - по умолчанию игра стала быстрее (интервал 5s). Запуск с "slow" аргументом вернёт 60s.
  */
 public class MainGame {
 
@@ -23,8 +25,12 @@ public class MainGame {
     private final List<Product> productCatalog;
     private final Payment paymentBox = new Payment();
     private int nextBasketId = 1;
-    private boolean running = true;
+    private volatile boolean running = true;
     private final long intervalMillis;
+
+    // Флаги/лок для координации ввода между потоками
+    private final AtomicBoolean promptActive = new AtomicBoolean(false);
+    private final Object promptLock = new Object();
 
     public MainGame(long intervalMillis) {
         this.intervalMillis = intervalMillis;
@@ -58,7 +64,7 @@ public class MainGame {
         productCatalog.add(pen);
         productCatalog.add(mug);
 
-        // Начальные остатки (умышленно небольшие для динамики игры)
+        // Начальные остатки
         warehouse.addProduct(apple.getProductId(), 10);
         warehouse.addProduct(milk.getProductId(), 8);
         warehouse.addProduct(usbCable.getProductId(), 3);
@@ -72,7 +78,7 @@ public class MainGame {
         productCatalog.forEach(p -> System.out.println("  " + p.getProductId() + ": " + p.getName() + " - " + p.getPrice()));
         System.out.println();
         System.out.println("Warehouse: " + warehouse);
-        System.out.println("Interval between customers: " + (intervalMillis/1000) + "s");
+        System.out.println("Interval between customers: " + (intervalMillis/1000) + "s (default fast)");
         System.out.println("Type 'help' and press Enter for commands.");
         System.out.println();
     }
@@ -86,7 +92,7 @@ public class MainGame {
             simulateCustomerArrival();
             // Sleep in chunks so exit is responsive
             long slept = 0;
-            long chunk = 500;
+            long chunk = 200;
             try {
                 while (slept < intervalMillis && running) {
                     Thread.sleep(Math.min(chunk, intervalMillis - slept));
@@ -100,8 +106,20 @@ public class MainGame {
         System.out.println("Cash in register: " + paymentBox.getTotalCash());
     }
 
+    /**
+     * Поток команд: читает только если в данный момент не открыт prompt (promptActive==false).
+     * Если promptActive==true — ждёт, пока он завершится.
+     */
     private void consoleCommandLoop() {
         while (running) {
+            // Если сейчас ожидается ввод в основном потоке — подождём
+            if (promptActive.get()) {
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException ignored) {}
+                continue;
+            }
+
             System.out.print(ANSI_BLUE + "> " + ANSI_RESET);
             String line;
             try {
@@ -286,34 +304,73 @@ public class MainGame {
         return list;
     }
 
+    /**
+     * Просит у пользователя 'y/n'. Устанавливает promptActive = true на время чтения,
+     * чтобы поток команд не вмешивался.
+     */
     private boolean askYesNo(String prompt) {
-        while (true) {
-            System.out.print(ANSI_BLUE + prompt + ANSI_RESET);
-            String line = safeReadLine();
-            if (line == null) return false;
-            line = line.trim().toLowerCase();
-            if (line.equals("y") || line.equals("yes")) return true;
-            if (line.equals("n") || line.equals("no")) return false;
-            System.out.println("Please input y or n.");
+        promptActive.set(true);
+        synchronized (promptLock) {
+            try {
+                while (true) {
+                    System.out.print(ANSI_BLUE + prompt + ANSI_RESET);
+                    String line = safeReadLine();
+                    if (line == null) {
+                        promptActive.set(false);
+                        return false;
+                    }
+                    line = line.trim().toLowerCase();
+                    if (line.equals("y") || line.equals("yes")) {
+                        promptActive.set(false);
+                        return true;
+                    }
+                    if (line.equals("n") || line.equals("no")) {
+                        promptActive.set(false);
+                        return false;
+                    }
+                    System.out.println("Please input y or n.");
+                }
+            } finally {
+                promptActive.set(false);
+            }
         }
     }
 
+    /**
+     * Читает целое число, также защищая доступ Scanner.
+     */
     private int askInt(String prompt) {
-        while (true) {
-            System.out.print(ANSI_BLUE + prompt + ANSI_RESET);
-            String line = safeReadLine();
-            if (line == null) return 0;
+        promptActive.set(true);
+        synchronized (promptLock) {
             try {
-                return Integer.parseInt(line.trim());
-            } catch (NumberFormatException ex) {
-                System.out.println("Invalid number, try again.");
+                while (true) {
+                    System.out.print(ANSI_BLUE + prompt + ANSI_RESET);
+                    String line = safeReadLine();
+                    if (line == null) {
+                        promptActive.set(false);
+                        return 0;
+                    }
+                    try {
+                        int v = Integer.parseInt(line.trim());
+                        promptActive.set(false);
+                        return v;
+                    } catch (NumberFormatException ex) {
+                        System.out.println("Invalid number, try again.");
+                    }
+                }
+            } finally {
+                promptActive.set(false);
             }
         }
     }
 
     private String safeReadLine() {
         try {
-            if (!SCANNER.hasNextLine()) return null;
+            while (!SCANNER.hasNextLine()) {
+                // Если поток закрывается — вернуть null
+                if (!running) return null;
+                try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            }
             return SCANNER.nextLine();
         } catch (NoSuchElementException ex) {
             return null;
@@ -328,9 +385,9 @@ public class MainGame {
     }
 
     public static void main(String[] args) {
-        long intervalMs = 60_000L;
-        if (args.length > 0 && "fast".equalsIgnoreCase(args[0])) {
-            intervalMs = 5_000L;
+        long intervalMs = 5_000L; // faster by default (5 sec)
+        if (args.length > 0 && "slow".equalsIgnoreCase(args[0])) {
+            intervalMs = 60_000L; // slow mode
         }
         MainGame game = new MainGame(intervalMs);
         game.run();
